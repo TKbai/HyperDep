@@ -52,14 +52,78 @@ class DistanceAdj(Module):
 class Model(nn.Module):
     def __init__(self, args):
         super(Model, self).__init__()
+
+        self.args = args
         self.manifold = getattr(manifolds, args.manifold)()
-        if self.manifold.name in ['Lorentz', 'Hyperboloid']:
-            args.feat_dim = args.feat_dim + 1
+
+        # =====================================================
+        # D-Vlog input setting:
+        # raw input = visual 136 + acoustic 25 = 161
+        # projected input for HyperVD = visual 128 + audio 128 = 256
+        # =====================================================
+        self.visual_dim = int(args.visual_dim)
+        self.audio_dim = int(args.audio_dim)
+        self.input_dim = self.visual_dim + self.audio_dim
+
+        self.visual_proj_dim = int(args.visual_proj_dim)
+        self.audio_proj_dim = int(args.audio_proj_dim)
+        self.raw_feat_dim = self.visual_proj_dim + self.audio_proj_dim
+
+        # args.feat_dim should be 256 before adding Lorentz time axis.
+        # For Lorentz/Hyperboloid, expm() will add one time-axis dimension.
+        base_feat_dim = int(args.feat_dim)
+
+        if self.manifold.name in ["Lorentz", "Hyperboloid"]:
+            if base_feat_dim == self.raw_feat_dim:
+                args.feat_dim = base_feat_dim + 1
+            elif base_feat_dim == self.raw_feat_dim + 1:
+                # Already added once. Keep it.
+                pass
+            else:
+                raise ValueError(
+                    f"args.feat_dim should be {self.raw_feat_dim} or "
+                    f"{self.raw_feat_dim + 1}, but got {base_feat_dim}."
+                )
+        else:
+            if base_feat_dim != self.raw_feat_dim:
+                raise ValueError(
+                    f"For non-Lorentz manifold, args.feat_dim should be "
+                    f"{self.raw_feat_dim}, but got {base_feat_dim}."
+                )
 
         self.disAdj = DistanceAdj()
 
-        self.conv1d1 = nn.Conv1d(in_channels=1024, out_channels=512, kernel_size=1, padding=0)
-        self.conv1d2 = nn.Conv1d(in_channels=512, out_channels=128, kernel_size=1, padding=0)
+        # =====================================================
+        # Visual projection: 136 -> 256 -> 128
+        # =====================================================
+        self.v_conv1 = nn.Conv1d(
+            in_channels=self.visual_dim,
+            out_channels=256,
+            kernel_size=1,
+            padding=0,
+        )
+        self.v_conv2 = nn.Conv1d(
+            in_channels=256,
+            out_channels=self.visual_proj_dim,
+            kernel_size=1,
+            padding=0,
+        )
+
+        # =====================================================
+        # Audio/acoustic projection: 25 -> 64 -> 128
+        # =====================================================
+        self.a_conv1 = nn.Conv1d(
+            in_channels=self.audio_dim,
+            out_channels=64,
+            kernel_size=1,
+            padding=0,
+        )
+        self.a_conv2 = nn.Conv1d(
+            in_channels=64,
+            out_channels=self.audio_proj_dim,
+            kernel_size=1,
+            padding=0,
+        )
 
         self.HFSGCN = FHyperGCN(args)
         self.HTRGCN = FHyperGCN(args)
@@ -69,108 +133,256 @@ class Model(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
         self.HyperCLS = HypClassifier(args)
-        self.args = args
-
 
     def forward(self, inputs, seq_len):
+        """
+        inputs: [B, T, 161]
+                first 136 dims are visual features,
+                last 25 dims are acoustic features.
 
-        xv = inputs[:,:,:1024]
-        xa = inputs[:,:,1024:]
-        xv = xv.permute(0, 2, 1)  # for conv1d
-        xv = self.relu(self.conv1d1(xv))
+        seq_len: [B], valid sequence length after padding.
+        """
+
+        if inputs.dim() != 3:
+            raise ValueError(
+                f"Expected inputs with shape [B, T, C], but got {inputs.shape}."
+            )
+
+        if inputs.size(-1) != self.input_dim:
+            raise ValueError(
+                f"Expected input dim {self.input_dim} "
+                f"= visual_dim {self.visual_dim} + audio_dim {self.audio_dim}, "
+                f"but got {inputs.size(-1)}."
+            )
+
+        # -----------------------------------------------------
+        # Split D-Vlog features
+        # -----------------------------------------------------
+        xv = inputs[:, :, :self.visual_dim]  # [B, T, 136]
+        xa = inputs[:, :, self.visual_dim:self.visual_dim + self.audio_dim]  # [B, T, 25]
+
+        # -----------------------------------------------------
+        # Visual branch
+        # [B, T, 136] -> [B, 136, T] -> [B, 128, T] -> [B, T, 128]
+        # -----------------------------------------------------
+        xv = xv.permute(0, 2, 1)
+        xv = self.relu(self.v_conv1(xv))
         xv = self.dropout(xv)
-        xv = self.relu(self.conv1d2(xv))
+        xv = self.relu(self.v_conv2(xv))
         xv = self.dropout(xv)
-        xv = xv.permute(0, 2, 1)  # b*t*c
+        xv = xv.permute(0, 2, 1)
 
-        x = torch.cat((xv, xa), -1)
+        # -----------------------------------------------------
+        # Acoustic branch
+        # [B, T, 25] -> [B, 25, T] -> [B, 128, T] -> [B, T, 128]
+        # -----------------------------------------------------
+        xa = xa.permute(0, 2, 1)
+        xa = self.relu(self.a_conv1(xa))
+        xa = self.dropout(xa)
+        xa = self.relu(self.a_conv2(xa))
+        xa = self.dropout(xa)
+        xa = xa.permute(0, 2, 1)
 
+        # -----------------------------------------------------
+        # Fuse visual and acoustic features
+        # [B, T, 128] + [B, T, 128] -> [B, T, 256]
+        # -----------------------------------------------------
+        x = torch.cat((xv, xa), dim=-1)
+
+        if x.size(-1) != self.raw_feat_dim:
+            raise ValueError(
+                f"Expected fused feature dim {self.raw_feat_dim}, "
+                f"but got {x.size(-1)}."
+            )
+
+        # Temporal-distance graph
         disadj = self.disAdj(x.shape[0], x.shape[1], self.args).to(x.device)
+
+        # Map Euclidean features to hyperbolic space
         proj_x = self.expm(x)
+
+        # Feature-similarity graph
         adj = self.adj(proj_x, seq_len)
 
+        # Two hyperbolic GCN branches
         x1 = self.relu(self.HFSGCN.encode(proj_x, adj))
         x1 = self.dropout(x1)
+
         x2 = self.relu(self.HTRGCN.encode(proj_x, disadj))
         x2 = self.dropout(x2)
 
+        out_x = torch.cat((x1, x2), dim=2)
 
-        out_x = torch.cat((x1, x2), 2)
+        # Frame/snippet-level logits
         frame_prob = self.HyperCLS(out_x)
+
+        # Video-level probability after MIL pooling
         mil_logits = self.clas(frame_prob, seq_len)
 
         return mil_logits, frame_prob
 
     def expm(self, x):
-        if self.manifold.name in ['Lorentz', 'Hyperboloid']:
+        """
+        Map Euclidean tangent vectors to Lorentz/Hyperboloid manifold.
+        Input x: [B, T, D]
+        Output:  [B, T, D + 1] when using Lorentz/Hyperboloid
+        """
+        if self.manifold.name in ["Lorentz", "Hyperboloid"]:
             o = torch.zeros_like(x)
             x = torch.cat([o[:, :, 0:1], x], dim=-1)
-            if self.manifold.name == 'Lorentz':
+
+            if self.manifold.name == "Lorentz":
                 x = self.manifold.expmap0(x)
-            return x
-        else:
+
             return x
 
+        return x
+
     def adj(self, x, seq_len):
-        soft = nn.Softmax(1)
+        """
+        Build feature-similarity graph in hyperbolic space.
+        x: [B, T, D]
+        """
+        soft = nn.Softmax(dim=1)
+
         x2 = self.lorentz_similarity(x, x, self.manifold.k)
         x2 = torch.exp(-x2)
+
         output = torch.zeros_like(x2)
+
         if seq_len is None:
             for i in range(x.shape[0]):
-                tmp = x2[i]
-                adj2 = tmp
+                adj2 = x2[i]
                 adj2 = F.threshold(adj2, 0.8, 0)
                 adj2 = soft(adj2)
                 output[i] = adj2
         else:
-            for i in range(len(seq_len)):
-                tmp = x2[i, :seq_len[i], :seq_len[i]]
-                adj2 = tmp
+            for i in range(x.shape[0]):
+                valid_len = seq_len[i]
+                if torch.is_tensor(valid_len):
+                    valid_len = int(valid_len.detach().cpu().item())
+                else:
+                    valid_len = int(valid_len)
+
+                valid_len = max(1, min(valid_len, x.shape[1]))
+
+                adj2 = x2[i, :valid_len, :valid_len]
                 adj2 = F.threshold(adj2, 0.8, 0)
                 adj2 = soft(adj2)
-                output[i, :seq_len[i], :seq_len[i]] = adj2
+
+                output[i, :valid_len, :valid_len] = adj2
+
         return output
 
     def clas(self, logits, seq_len):
-        logits = logits.squeeze()
-        instance_logits = torch.zeros(0).to(logits.device)  # tensor([])
+        """
+        MIL pooling from snippet-level logits to video-level probability.
+
+        Supported pooling:
+            topk       : original HyperVD pooling
+            mean       : average over all valid snippets
+            topk_mean  : alpha * mean + (1 - alpha) * topk
+
+        For D-Vlog depression detection, topk_mean is often more suitable
+        than pure topk because depressive cues are usually diffuse rather
+        than short burst events.
+        """
+
+        # logits: [B, T, 1] -> [B, T]
+        logits = logits.squeeze(-1)
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        pooling = getattr(self.args, "pooling", "topk")
+        pool_alpha = float(getattr(self.args, "pool_alpha", 0.5))
+        topk_divisor = int(getattr(self.args, "topk_divisor", 16))
+
+        pool_alpha = max(0.0, min(1.0, pool_alpha))
+        topk_divisor = max(1, topk_divisor)
+
+        instance_logits = []
+
         for i in range(logits.shape[0]):
             if seq_len is None:
-                tmp = torch.mean(logits[i]).view(1)
+                valid_len = logits.shape[1]
             else:
-                tmp, _ = torch.topk(logits[i][:seq_len[i]], k=int(torch.div(seq_len[i], 16, rounding_mode='floor') + 1),
-                                largest=True)
-                tmp = torch.mean(tmp).view(1)
-            instance_logits = torch.cat((instance_logits, tmp))
-        instance_logits = torch.sigmoid(instance_logits)
-        return instance_logits
+                valid_len = seq_len[i]
+
+                if torch.is_tensor(valid_len):
+                    valid_len = int(valid_len.detach().cpu().item())
+                else:
+                    valid_len = int(valid_len)
+
+                valid_len = max(1, min(valid_len, logits.shape[1]))
+
+            valid_scores = logits[i, :valid_len]
+
+            mean_score = torch.mean(valid_scores)
+
+            k = valid_len // topk_divisor + 1
+            k = max(1, min(k, valid_len))
+
+            topk_score, _ = torch.topk(
+                valid_scores,
+                k=k,
+                largest=True,
+            )
+            topk_score = torch.mean(topk_score)
+
+            if pooling == "topk":
+                video_score = topk_score
+
+            elif pooling == "mean":
+                video_score = mean_score
+
+            elif pooling == "topk_mean":
+                video_score = pool_alpha * mean_score + (1.0 - pool_alpha) * topk_score
+
+            else:
+                raise ValueError(f"Unknown pooling strategy: {pooling}")
+
+            instance_logits.append(video_score.view(1))
+
+        instance_logits = torch.cat(instance_logits, dim=0)
+
+        # Keep the same behavior as before:
+        # model output is probability, criterion uses BCELoss.
+        instance_prob = torch.sigmoid(instance_logits)
+
+        return instance_prob
 
     def lorentz_similarity(self, x: torch.Tensor, y: torch.Tensor, k) -> torch.Tensor:
-        '''
-        d = <x, y>   lorentz metric
-        '''
-        self.eps = {torch.float32: 1e-6, torch.float64: 1e-8}
-        idx = np.concatenate((np.array([-1]), np.ones(x.shape[-1] - 1)))
-        diag = torch.from_numpy(np.diag(idx).astype(np.float32)).to(x.device)
-        temp = x @ diag
+        """
+        Lorentz distance matrix.
+
+        x: [B, T, D]
+        y: [B, T, D]
+        return: [B, T, T]
+        """
+
+        eps = 1e-6 if x.dtype == torch.float32 else 1e-8
+
+        # Lorentz metric diag(-1, 1, ..., 1)
+        metric = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
+        metric[0] = -1.0
+
+        temp = x * metric
         xy_inner = -(temp @ y.transpose(-1, -2))
-        xy_inner_ = F.threshold(xy_inner, 1, 1)
-        sqrt_k = k**0.5
-        dist = sqrt_k * self.arccosh(xy_inner_ / k)
-        dist = torch.clamp(dist, min=self.eps[x.dtype], max=200)
+
+        xy_inner = torch.clamp(xy_inner, min=1.0 + eps)
+
+        sqrt_k = k ** 0.5
+        dist = sqrt_k * self.arccosh(xy_inner / k)
+        dist = torch.clamp(dist, min=eps, max=200)
+
         return dist
 
     def arccosh(self, x):
         """
-        Element-wise arcosh operation.
-        Parameters
-        ---
-        x : torch.Tensor[]
-        Returns
-        ---
-        torch.Tensor[]
-            arcosh result.
+        Numerically stable arccosh.
         """
-        return torch.log(x + torch.sqrt(torch.pow(x, 2) - 1))
+        eps = 1e-6 if x.dtype == torch.float32 else 1e-8
+        x = torch.clamp(x, min=1.0 + eps)
+        return torch.log(x + torch.sqrt(torch.pow(x, 2) - 1.0))
 

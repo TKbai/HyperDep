@@ -2,60 +2,87 @@ import torch
 from tqdm import tqdm
 
 
-def CENTROPY(logits, logits2, seq_len,):
-    instance_logits = torch.tensor(0)  # tensor([])
-    for i in range(logits.shape[0]):
-        tmp1 = torch.sigmoid(logits[i, :seq_len[i]]).squeeze()
-        tmp2 = torch.sigmoid(logits2[i, :seq_len[i]]).squeeze()
-        loss = torch.mean(-tmp1.detach() * torch.log(tmp2))
-        instance_logits = instance_logits + loss
-    instance_logits = instance_logits/logits.shape[0]
-    return instance_logits
+def train(dataloader, model, optimizer, args, criterion, max_batches=None):
+    """
+    D-Vlog training function for HyperVD.
 
+    dataloader returns:
+        inputs: [B, T, 161]
+        labels: [B] or [B, 1]
 
-def train(dataloader, model, optimizer, args, criterion):
-    t_loss = []
+    model returns:
+        mil_logits: [B], already passed through sigmoid
+        frame_logits: [B, T, 1]
+    """
 
-    with torch.set_grad_enabled(True):
-        model.train()
-        # for i, (n_inputs, a_inputs, n_labels, a_labels) in tqdm(enumerate(dataloader)):
-        #     inputs = torch.cat([n_inputs, a_inputs], dim=0).cuda().float()
-        #     labels = torch.cat([n_labels, a_labels], dim=0).cuda().float()
-        for i, (inputs, labels) in tqdm(enumerate(dataloader)):
-            seq_len = torch.sum(torch.max(torch.abs(inputs), dim=2)[0] > 0, 1)
-            inputs = inputs[:, :torch.max(seq_len), :]
-            inputs = inputs.float().to(args.device)
-            labels = labels.float().to(args.device)
+    model.train()
 
-            # features, v_logits, a_logits, av_logits = model(inputs)
-            mil_logits, logits = model(inputs, seq_len)
-            # logits = logits.squeeze()
-            # audio_logits = audio_logits.squeeze()
-            # visual_logits = visual_logits.squeeze()
-            #
-            # cmaloss_v2a_a2n, cmaloss_a2v_v2n = CMAL(mmil_logits, audio_logits, visual_logits, seq_len, audio_rep,
-            #                                         visual_rep)
+    total_loss = 0.0
+    num_batches = 0
 
-            # cmaloss1, cmaloss2 = CMAL2(logits, clip_feat, seq_feat, seq_len, idx)
+    for i, (inputs, labels) in tqdm(
+        enumerate(dataloader),
+        total=len(dataloader),
+        desc="Training",
+    ):
+        if max_batches is not None and i >= max_batches:
+            break
 
-            clsloss = criterion(mil_logits, labels)
-            # clsloss2 = criterion(seq_logtis, labels)
-            # total_loss = clsloss + args.lamda * cmaloss_v2a_a2n + args.lamda * cmaloss_a2v_v2n
+        if inputs.dim() != 3:
+            raise ValueError(f"Expected inputs shape [B, T, C], got {inputs.shape}")
 
-            loss = clsloss
+        # --------------------------------------------------
+        # Compute valid sequence length before moving to GPU.
+        # Padding positions should be all-zero features.
+        # --------------------------------------------------
+        with torch.no_grad():
+            seq_len = torch.sum(
+                torch.max(torch.abs(inputs), dim=2)[0] > 0,
+                dim=1,
+            )
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            max_len = int(seq_len.max().item())
+            max_len = max(1, max_len)
 
-            # unit = dataloader.__len__() // 2
-            # if i % unit == 0:
-            #     print(f"Current Lambda_a2n: {args.lamda:.4f}")
-            #     print(
-            #         f"MIL Loss: {clsloss:.4f},  loss1: { args.lamda * cmaloss1:.4f},  loss2: { args.lamda * cmaloss2:.4f} ")
+        # Trim useless padded tail to reduce memory cost.
+        inputs = inputs[:, :max_len, :]
 
-            t_loss.append(loss)
+        inputs = inputs.float().to(args.device, non_blocking=True)
+        labels = labels.float().view(-1).to(args.device, non_blocking=True)
+        seq_len = seq_len.to(args.device)
 
-    # return sum(t_loss)/len(t_loss), sum(loss1)/len(loss1), sum(loss2)/len(loss2), sum(loss3)/len(loss3)
-    return sum(t_loss)/len(t_loss), 0, 0, 0
+        mil_logits, frame_logits = model(inputs, seq_len)
 
+        mil_logits = mil_logits.view(-1)
+
+        if mil_logits.shape != labels.shape:
+            raise ValueError(
+                f"mil_logits shape {mil_logits.shape} does not match "
+                f"labels shape {labels.shape}"
+            )
+
+        loss = criterion(mil_logits, labels)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            raise FloatingPointError(
+                f"Invalid loss detected: {loss.item()}. "
+                f"Check normalization, learning rate, or hyperbolic distance."
+            )
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+
+        # Hyperbolic models can be numerically sensitive.
+        # Gradient clipping makes the first migration more stable.
+        grad_clip = getattr(args, "grad_clip", 5.0)
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+
+        optimizer.step()
+
+        total_loss += loss.detach().item()
+        num_batches += 1
+
+    avg_loss = total_loss / max(num_batches, 1)
+
+    return avg_loss, 0, 0, 0

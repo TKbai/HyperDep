@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+conda_env/
+*.log
+
+# Dataset / features
+dvlog-dataset/
+D-Vlog/
+DVlog/
+*.npy
+*.npz
+
+# Checkpoints / outputs
+ckpt/
+ckpt_dvlog/
+checkpoints/
+outputs/
+runs/
+wandb/
+logs/
+
+# Large model files
+*.pkl
+*.pt
+*.pth
+*.ckpt
+
+# System
+.DS_Store
+Thumbs.db
