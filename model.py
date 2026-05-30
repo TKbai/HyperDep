@@ -69,6 +69,11 @@ class Model(nn.Module):
         self.audio_proj_dim = int(args.audio_proj_dim)
         self.raw_feat_dim = self.visual_proj_dim + self.audio_proj_dim
 
+        self.fusion = getattr(args, "fusion", "concat_proj")
+
+        if self.fusion not in ["concat_proj", "detour_adapted", "gated_scalar", "residual_gate"]:
+            raise ValueError(f"Unknown fusion type: {self.fusion}")
+
         # args.feat_dim should be 256 before adding Lorentz time axis.
         # For Lorentz/Hyperboloid, expm() will add one time-axis dimension.
         base_feat_dim = int(args.feat_dim)
@@ -94,14 +99,27 @@ class Model(nn.Module):
         self.disAdj = DistanceAdj()
 
         # =====================================================
-        # Visual projection: 136 -> 256 -> 128
+        # Visual projection
+        #
+        # concat_proj:
+        #   visual: 136 -> 256 -> 128
+        #   audio : 25  -> 64  -> 128
+        #
+        # detour_adapted:
+        #   visual: 136 -> 256 -> 128
+        #   audio : 25  -> 128
+        #
+        # detour_adapted is closer to HyperVD's detour fusion:
+        # visual branch is learned more strongly, audio branch is kept shallower.
         # =====================================================
+
         self.v_conv1 = nn.Conv1d(
             in_channels=self.visual_dim,
             out_channels=256,
             kernel_size=1,
             padding=0,
         )
+
         self.v_conv2 = nn.Conv1d(
             in_channels=256,
             out_channels=self.visual_proj_dim,
@@ -109,21 +127,66 @@ class Model(nn.Module):
             padding=0,
         )
 
-        # =====================================================
-        # Audio/acoustic projection: 25 -> 64 -> 128
-        # =====================================================
-        self.a_conv1 = nn.Conv1d(
-            in_channels=self.audio_dim,
-            out_channels=64,
-            kernel_size=1,
-            padding=0,
-        )
-        self.a_conv2 = nn.Conv1d(
-            in_channels=64,
-            out_channels=self.audio_proj_dim,
-            kernel_size=1,
-            padding=0,
-        )
+        self.a_conv1 = None
+        self.a_conv2 = None
+        self.a_proj = None
+
+        if self.fusion in ["concat_proj", "gated_scalar", "residual_gate"]:
+            # Current baseline: symmetric two-step audio projection
+            # Also used by gated_scalar fusion.
+            self.a_conv1 = nn.Conv1d(
+                in_channels=self.audio_dim,
+                out_channels=64,
+                kernel_size=1,
+                padding=0,
+            )
+
+            self.a_conv2 = nn.Conv1d(
+                in_channels=64,
+                out_channels=self.audio_proj_dim,
+                kernel_size=1,
+                padding=0,
+            )
+
+        elif self.fusion == "detour_adapted":
+            # HyperVD-style adapted detour:
+            # audio is only linearly projected to 128 dim,
+            # without extra nonlinearity/dropout.
+            self.a_proj = nn.Conv1d(
+                in_channels=self.audio_dim,
+                out_channels=self.audio_proj_dim,
+                kernel_size=1,
+                padding=0,
+            )
+
+        # -----------------------------------------------------
+        # Scalar modality reliability gate.
+        # Used only when fusion == "gated_scalar".
+        # gate_t controls frame-level visual/audio reliability.
+        # -----------------------------------------------------
+        self.gate_mlp = None
+
+        if self.fusion in ["gated_scalar", "residual_gate"]:
+            if self.visual_proj_dim != self.audio_proj_dim:
+                raise ValueError(
+                    "gated_scalar requires visual_proj_dim == audio_proj_dim, "
+                    f"but got {self.visual_proj_dim} and {self.audio_proj_dim}"
+                )
+
+            gate_in_dim = self.visual_proj_dim * 3  # [v, a, |v-a|]
+
+            self.gate_mlp = nn.Sequential(
+                nn.Linear(gate_in_dim, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, 1),
+            )
+
+            # Initialize gate around 0.5.
+            # With x = concat(2*g*v, 2*(1-g)*a),
+            # g=0.5 makes the module start from normal concat behavior.
+            nn.init.zeros_(self.gate_mlp[-1].weight)
+            nn.init.zeros_(self.gate_mlp[-1].bias)
+        self.gate_gamma = float(getattr(args, "gate_gamma", 0.25))
 
         self.HFSGCN = FHyperGCN(args)
         self.HTRGCN = FHyperGCN(args)
@@ -174,20 +237,62 @@ class Model(nn.Module):
 
         # -----------------------------------------------------
         # Acoustic branch
-        # [B, T, 25] -> [B, 25, T] -> [B, 128, T] -> [B, T, 128]
+        # concat_proj:
+        #   [B, T, 25] -> [B, 25, T] -> [B, 64, T] -> [B, 128, T] -> [B, T, 128]
+        #
+        # detour_adapted:
+        #   [B, T, 25] -> [B, 25, T] -> [B, 128, T] -> [B, T, 128]
         # -----------------------------------------------------
         xa = xa.permute(0, 2, 1)
-        xa = self.relu(self.a_conv1(xa))
-        xa = self.dropout(xa)
-        xa = self.relu(self.a_conv2(xa))
-        xa = self.dropout(xa)
+
+        if self.fusion in ["concat_proj", "gated_scalar", "residual_gate"]:
+            xa = self.relu(self.a_conv1(xa))
+            xa = self.dropout(xa)
+            xa = self.relu(self.a_conv2(xa))
+            xa = self.dropout(xa)
+
+        elif self.fusion == "detour_adapted":
+            xa = self.a_proj(xa)
+
+        else:
+            raise ValueError(f"Unknown fusion type: {self.fusion}")
+
         xa = xa.permute(0, 2, 1)
 
         # -----------------------------------------------------
         # Fuse visual and acoustic features
-        # [B, T, 128] + [B, T, 128] -> [B, T, 256]
         # -----------------------------------------------------
-        x = torch.cat((xv, xa), dim=-1)
+        if self.fusion in ["gated_scalar", "residual_gate"]:
+            gate_input = torch.cat(
+                [
+                    xv,
+                    xa,
+                    torch.abs(xv - xa),
+                ],
+                dim=-1,
+            )
+
+            gate = torch.sigmoid(self.gate_mlp(gate_input))  # [B, T, 1]
+
+            if self.fusion == "gated_scalar":
+                # Raw gate, kept for ablation.
+                xv_gated = 2.0 * gate * xv
+                xa_gated = 2.0 * (1.0 - gate) * xa
+
+            elif self.fusion == "residual_gate":
+                # Conservative residual gate.
+                # delta is restricted to [-gamma, gamma].
+                gamma = max(0.0, min(float(self.gate_gamma), 1.0))
+                delta = gamma * (2.0 * gate - 1.0)
+
+                xv_gated = (1.0 + delta) * xv
+                xa_gated = (1.0 - delta) * xa
+
+            x = torch.cat((xv_gated, xa_gated), dim=-1)
+
+        else:
+            x = torch.cat((xv, xa), dim=-1)
+
 
         if x.size(-1) != self.raw_feat_dim:
             raise ValueError(

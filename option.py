@@ -158,6 +158,23 @@ parser.add_argument(
     help="MIL pooling strategy: topk, mean, or topk_mean",
 )
 
+
+
+parser.add_argument(
+    "--fusion",
+    default="concat_proj",
+    choices=["concat_proj", "detour_adapted", "gated_scalar", "residual_gate"],
+    help="fusion type: concat_proj, detour_adapted, gated_scalar, or residual_gate",
+)
+
+parser.add_argument(
+    "--gate-gamma",
+    type=float,
+    default=0.25,
+    help="maximum residual gate strength for residual_gate fusion",
+)
+
+
 parser.add_argument(
     "--pool-alpha",
     type=float,
