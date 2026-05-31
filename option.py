@@ -141,6 +141,27 @@ parser.add_argument("--num-classes", type=int, default=1, help="binary classific
 # 先用 200 跑通 debug；正式实验后面再命令行改成 596
 parser.add_argument("--max-seqlen", type=int, default=200, help="maximum sequence length during training")
 
+parser.add_argument(
+    "--train-num-windows",
+    type=int,
+    default=1,
+    help="number of temporal windows sampled per video during training",
+)
+
+parser.add_argument(
+    "--eval-num-windows",
+    type=int,
+    default=1,
+    help="number of deterministic temporal windows per video during validation/test",
+)
+
+parser.add_argument(
+    "--window-agg",
+    default="mean",
+    choices=["mean", "max", "top2_mean", "top3_mean"],
+    help="aggregation method for multi-window video probability",
+)
+
 parser.add_argument("--max-epoch", type=int, default=50, help="maximum training epoch")
 parser.add_argument("--seed", type=int, default=9, help="random seed")
 
@@ -187,6 +208,20 @@ parser.add_argument(
     type=int,
     default=16,
     help="k = valid_len // topk_divisor + 1 for top-k MIL pooling",
+)
+
+parser.add_argument(
+    "--aux-loss-weight",
+    type=float,
+    default=0.0,
+    help="weight for visual/audio auxiliary classification losses",
+)
+
+parser.add_argument(
+    "--aux-modalities",
+    default="both",
+    choices=["none", "visual", "audio", "both"],
+    help="which auxiliary unimodal losses to use",
 )
 
 parser.add_argument("--eval-threshold", type=float, default=0.5, help="default classification threshold")

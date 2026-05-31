@@ -20,16 +20,14 @@ def _get_device(args):
 @torch.no_grad()
 def collect_dvlog_outputs(dataloader, model, args, max_batches=None):
     """
-    Collect video-level probabilities and labels from D-Vlog dataloader.
+    Collect video-level probabilities and labels.
 
-    dataloader returns:
-        inputs: [B, T, 161]
-        labels: [B]
-
-    model returns:
-        video_prob: [B]
-        frame_prob: [B, T, 1]
+    Supports:
+        inputs: [B, T, C]
+        inputs: [B, K, T, C]
     """
+
+    from window_utils import aggregate_window_probs_tensor
 
     device = _get_device(args)
     model.eval()
@@ -41,27 +39,63 @@ def collect_dvlog_outputs(dataloader, model, args, max_batches=None):
         if max_batches is not None and batch_idx >= max_batches:
             break
 
-        if inputs.dim() != 3:
-            raise ValueError(f"Expected inputs shape [B, T, C], got {inputs.shape}")
-
-        # Same seq_len logic as train.py.
-        seq_len = torch.sum(
-            torch.max(torch.abs(inputs), dim=2)[0] > 0,
-            dim=1,
-        )
-
-        max_len = int(seq_len.max().item())
-        max_len = max(1, max_len)
-
-        # Trim padded tail to reduce memory.
-        inputs = inputs[:, :max_len, :]
-
-        inputs = inputs.float().to(device, non_blocking=True)
         labels = labels.float().view(-1).to(device, non_blocking=True)
-        seq_len = seq_len.to(device)
 
-        video_prob, frame_prob = model(inputs, seq_len)
-        video_prob = video_prob.view(-1)
+        # ==================================================
+        # Case 1: standard input [B, T, C]
+        # ==================================================
+        if inputs.dim() == 3:
+            seq_len = torch.sum(
+                torch.max(torch.abs(inputs), dim=2)[0] > 0,
+                dim=1,
+            )
+            seq_len = torch.clamp(seq_len, min=1)
+
+            max_len = int(seq_len.max().item())
+            max_len = max(1, max_len)
+
+            inputs = inputs[:, :max_len, :]
+
+            inputs = inputs.float().to(device, non_blocking=True)
+            seq_len = seq_len.to(device)
+
+            video_prob, frame_prob = model(inputs, seq_len)
+            video_prob = video_prob.view(-1)
+
+        # ==================================================
+        # Case 2: multi-window input [B, K, T, C]
+        # ==================================================
+        elif inputs.dim() == 4:
+            b, k, t, c = inputs.shape
+
+            inputs = inputs.view(b * k, t, c)
+
+            seq_len = torch.sum(
+                torch.max(torch.abs(inputs), dim=2)[0] > 0,
+                dim=1,
+            )
+            seq_len = torch.clamp(seq_len, min=1)
+
+            max_len = int(seq_len.max().item())
+            max_len = max(1, max_len)
+
+            inputs = inputs[:, :max_len, :]
+
+            inputs = inputs.float().to(device, non_blocking=True)
+            seq_len = seq_len.to(device)
+
+            window_prob, frame_prob = model(inputs, seq_len)
+            window_prob = window_prob.view(b, k)
+
+            video_prob = aggregate_window_probs_tensor(
+                window_prob,
+                mode=getattr(args, "window_agg", "mean"),
+            )
+
+        else:
+            raise ValueError(
+                f"Expected inputs shape [B,T,C] or [B,K,T,C], got {inputs.shape}"
+            )
 
         if torch.isnan(video_prob).any() or torch.isinf(video_prob).any():
             raise FloatingPointError(

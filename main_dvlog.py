@@ -13,6 +13,7 @@ from model import Model
 from dataset_dvlog import DVlogDataset
 from train import train
 from eval_dvlog import evaluate_dvlog, find_best_threshold, print_metrics
+from dataset_dvlog_mw import DVlogMultiWindowDataset
 
 
 def setup_seed(seed):
@@ -34,14 +35,32 @@ def get_device(args):
 
 
 def build_loader(args, fold, shuffle, random_crop):
-    dataset = DVlogDataset(
-        root=args.data_root,
-        fold=fold,
-        gender=args.gender,
-        max_seqlen=args.max_seqlen,
-        random_crop=random_crop,
-        stats_path=args.stats_path,
-    )
+    is_train = fold == args.train_fold
+
+    if is_train:
+        num_windows = int(getattr(args, "train_num_windows", 1))
+    else:
+        num_windows = int(getattr(args, "eval_num_windows", 1))
+
+    if num_windows > 1:
+        dataset = DVlogMultiWindowDataset(
+            root=args.data_root,
+            fold=fold,
+            gender=args.gender,
+            max_seqlen=args.max_seqlen,
+            num_windows=num_windows,
+            random_windows=random_crop,
+            stats_path=args.stats_path,
+        )
+    else:
+        dataset = DVlogDataset(
+            root=args.data_root,
+            fold=fold,
+            gender=args.gender,
+            max_seqlen=args.max_seqlen,
+            random_crop=random_crop,
+            stats_path=args.stats_path,
+        )
 
     loader = DataLoader(
         dataset,
@@ -75,6 +94,10 @@ def main():
     print("batch_size  :", args.batch_size)
     print("lr          :", args.lr)
     print("metric      :", args.metric)
+    print("fusion      :", args.fusion)
+    print("train_windows:", args.train_num_windows)
+    print("eval_windows :", args.eval_num_windows)
+    print("window_agg   :", args.window_agg)
     print("save_dir    :", args.save_dir)
     print("model_name  :", args.model_name)
     print("============================================")

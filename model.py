@@ -188,6 +188,10 @@ class Model(nn.Module):
             nn.init.zeros_(self.gate_mlp[-1].bias)
         self.gate_gamma = float(getattr(args, "gate_gamma", 0.25))
 
+        self.v_aux_cls = nn.Linear(self.visual_proj_dim, 1)
+        self.a_aux_cls = nn.Linear(self.audio_proj_dim, 1)
+        self.aux_outputs = {}
+
         self.HFSGCN = FHyperGCN(args)
         self.HTRGCN = FHyperGCN(args)
 
@@ -258,6 +262,22 @@ class Model(nn.Module):
             raise ValueError(f"Unknown fusion type: {self.fusion}")
 
         xa = xa.permute(0, 2, 1)
+
+
+        self.aux_outputs = {}
+
+        aux_loss_weight = float(getattr(self.args, "aux_loss_weight", 0.0))
+        aux_modalities = getattr(self.args, "aux_modalities", "both")
+
+        if self.training and aux_loss_weight > 0 and aux_modalities != "none":
+
+            if aux_modalities in ["visual", "both"]:
+                v_frame_logits = self.v_aux_cls(xv)
+                self.aux_outputs["visual"] = self.clas(v_frame_logits, seq_len)
+
+            if aux_modalities in ["audio", "both"]:
+                a_frame_logits = self.a_aux_cls(xa)
+                self.aux_outputs["audio"] = self.clas(a_frame_logits, seq_len)
 
         # -----------------------------------------------------
         # Fuse visual and acoustic features

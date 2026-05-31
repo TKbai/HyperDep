@@ -1,18 +1,79 @@
 import torch
 from tqdm import tqdm
 
+from window_utils import aggregate_window_probs_tensor
+
+
+def _compute_seq_len(inputs):
+    """
+    inputs: [B, T, C]
+    return: [B]
+    """
+    seq_len = torch.sum(
+        torch.max(torch.abs(inputs), dim=2)[0] > 0,
+        dim=1,
+    )
+
+    seq_len = torch.clamp(seq_len, min=1)
+
+    return seq_len
+
+
+def _compute_loss_with_aux(model, criterion, labels, args, base_loss, batch_size=None, num_windows=None):
+    """
+    Add auxiliary unimodal losses if enabled.
+
+    For normal training:
+        aux_prob: [B]
+
+    For multi-window training:
+        aux_prob: [B*K], reshape to [B, K] and aggregate.
+    """
+
+    loss = base_loss
+
+    aux_loss_weight = float(getattr(args, "aux_loss_weight", 0.0))
+
+    if aux_loss_weight <= 0:
+        return loss
+
+    if not hasattr(model, "aux_outputs"):
+        return loss
+
+    aux_losses = []
+
+    for aux_name, aux_prob in model.aux_outputs.items():
+        aux_prob = aux_prob.view(-1)
+
+        if batch_size is not None and num_windows is not None:
+            aux_prob = aux_prob.view(batch_size, num_windows)
+            aux_prob = aggregate_window_probs_tensor(
+                aux_prob,
+                mode=getattr(args, "window_agg", "mean"),
+            )
+
+        if aux_prob.shape != labels.shape:
+            raise ValueError(
+                f"aux output {aux_name} shape {aux_prob.shape} "
+                f"does not match labels shape {labels.shape}"
+            )
+
+        aux_losses.append(criterion(aux_prob, labels))
+
+    if len(aux_losses) > 0:
+        aux_loss = torch.stack(aux_losses).mean()
+        loss = loss + aux_loss_weight * aux_loss
+
+    return loss
+
 
 def train(dataloader, model, optimizer, args, criterion, max_batches=None):
     """
     D-Vlog training function for HyperVD.
 
-    dataloader returns:
-        inputs: [B, T, 161]
-        labels: [B] or [B, 1]
-
-    model returns:
-        mil_logits: [B], already passed through sigmoid
-        frame_logits: [B, T, 1]
+    Supports:
+        inputs: [B, T, C]
+        inputs: [B, K, T, C]
     """
 
     model.train()
@@ -28,40 +89,93 @@ def train(dataloader, model, optimizer, args, criterion, max_batches=None):
         if max_batches is not None and i >= max_batches:
             break
 
-        if inputs.dim() != 3:
-            raise ValueError(f"Expected inputs shape [B, T, C], got {inputs.shape}")
-
-        # --------------------------------------------------
-        # Compute valid sequence length before moving to GPU.
-        # Padding positions should be all-zero features.
-        # --------------------------------------------------
-        with torch.no_grad():
-            seq_len = torch.sum(
-                torch.max(torch.abs(inputs), dim=2)[0] > 0,
-                dim=1,
-            )
-
-            max_len = int(seq_len.max().item())
-            max_len = max(1, max_len)
-
-        # Trim useless padded tail to reduce memory cost.
-        inputs = inputs[:, :max_len, :]
-
-        inputs = inputs.float().to(args.device, non_blocking=True)
         labels = labels.float().view(-1).to(args.device, non_blocking=True)
-        seq_len = seq_len.to(args.device)
 
-        mil_logits, frame_logits = model(inputs, seq_len)
+        # ==================================================
+        # Case 1: standard single-window input [B, T, C]
+        # ==================================================
+        if inputs.dim() == 3:
+            with torch.no_grad():
+                seq_len = _compute_seq_len(inputs)
+                max_len = int(seq_len.max().item())
+                max_len = max(1, max_len)
 
-        mil_logits = mil_logits.view(-1)
+            inputs = inputs[:, :max_len, :]
 
-        if mil_logits.shape != labels.shape:
-            raise ValueError(
-                f"mil_logits shape {mil_logits.shape} does not match "
-                f"labels shape {labels.shape}"
+            inputs = inputs.float().to(args.device, non_blocking=True)
+            seq_len = seq_len.to(args.device)
+
+            video_prob, frame_prob = model(inputs, seq_len)
+            video_prob = video_prob.view(-1)
+
+            if video_prob.shape != labels.shape:
+                raise ValueError(
+                    f"video_prob shape {video_prob.shape} does not match "
+                    f"labels shape {labels.shape}"
+                )
+
+            loss = criterion(video_prob, labels)
+            loss = _compute_loss_with_aux(
+                model=model,
+                criterion=criterion,
+                labels=labels,
+                args=args,
+                base_loss=loss,
             )
 
-        loss = criterion(mil_logits, labels)
+        # ==================================================
+        # Case 2: multi-window input [B, K, T, C]
+        # ==================================================
+        elif inputs.dim() == 4:
+            b, k, t, c = inputs.shape
+
+            if labels.shape[0] != b:
+                raise ValueError(
+                    f"labels batch size {labels.shape[0]} does not match "
+                    f"inputs batch size {b}"
+                )
+
+            inputs = inputs.view(b * k, t, c)
+
+            with torch.no_grad():
+                seq_len = _compute_seq_len(inputs)
+                max_len = int(seq_len.max().item())
+                max_len = max(1, max_len)
+
+            inputs = inputs[:, :max_len, :]
+
+            inputs = inputs.float().to(args.device, non_blocking=True)
+            seq_len = seq_len.to(args.device)
+
+            window_prob, frame_prob = model(inputs, seq_len)
+            window_prob = window_prob.view(b, k)
+
+            video_prob = aggregate_window_probs_tensor(
+                window_prob,
+                mode=getattr(args, "window_agg", "mean"),
+            )
+
+            if video_prob.shape != labels.shape:
+                raise ValueError(
+                    f"video_prob shape {video_prob.shape} does not match "
+                    f"labels shape {labels.shape}"
+                )
+
+            loss = criterion(video_prob, labels)
+            loss = _compute_loss_with_aux(
+                model=model,
+                criterion=criterion,
+                labels=labels,
+                args=args,
+                base_loss=loss,
+                batch_size=b,
+                num_windows=k,
+            )
+
+        else:
+            raise ValueError(
+                f"Expected inputs shape [B,T,C] or [B,K,T,C], got {inputs.shape}"
+            )
 
         if torch.isnan(loss) or torch.isinf(loss):
             raise FloatingPointError(
@@ -72,8 +186,6 @@ def train(dataloader, model, optimizer, args, criterion, max_batches=None):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
 
-        # Hyperbolic models can be numerically sensitive.
-        # Gradient clipping makes the first migration more stable.
         grad_clip = getattr(args, "grad_clip", 5.0)
         if grad_clip is not None and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
