@@ -51,7 +51,7 @@ def _compute_loss_with_aux(model, criterion, labels, args, base_loss, batch_size
 
             # Auxiliary branches do not have window embeddings.
             # Use mean aggregation for aux loss when main aggregation is learn_attn.
-            if aux_agg_mode == "learn_attn":
+            if aux_agg_mode in ["learn_attn", "learn_attn_conf"]:
                 aux_agg_mode = "mean"
 
             aux_prob = aggregate_window_probs_tensor(
@@ -156,7 +156,7 @@ def train(dataloader, model, optimizer, args, criterion, max_batches=None):
 
             window_agg = getattr(args, "window_agg", "mean")
 
-            if window_agg == "learn_attn":
+            if window_agg in ["learn_attn", "learn_attn_conf"]:
                 window_prob, frame_prob, window_emb = model(
                     inputs,
                     seq_len,
@@ -171,12 +171,18 @@ def train(dataloader, model, optimizer, args, criterion, max_batches=None):
             if window_emb is not None:
                 window_emb = window_emb.view(b, k, -1)
 
+            if window_agg == "learn_attn_conf":
+                attn_layer = getattr(model, "window_attn_conf", None)
+            else:
+                attn_layer = getattr(model, "window_attn", None)
+
             video_prob = aggregate_window_probs_tensor(
                 window_prob,
                 mode=window_agg,
                 window_emb=window_emb,
-                attn_layer=getattr(model, "window_attn", None),
+                attn_layer=attn_layer,
                 attn_temperature=getattr(args, "window_attn_temperature", 1.0),
+                attn_logit_bias=getattr(args, "window_attn_logit_bias", 0.5),
             )
 
             if video_prob.shape != labels.shape:

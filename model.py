@@ -270,6 +270,29 @@ class Model(nn.Module):
             ),
         )
 
+        # -----------------------------------------------------
+        # Confidence-aware learnable window attention.
+        # Input = window_emb + [prob, logit, centered_logit]
+        # -----------------------------------------------------
+        self.window_attn_conf = nn.Sequential(
+            nn.Linear(
+                self.window_emb_dim + 3,
+                int(getattr(args, "window_attn_hidden", 64)),
+            ),
+            nn.Tanh(),
+            nn.Dropout(float(getattr(args, "window_attn_dropout", 0.1))),
+            nn.Linear(
+                int(getattr(args, "window_attn_hidden", 64)),
+                1,
+            ),
+        )
+
+        # Zero-init final layer.
+        # Attention starts from the confidence prior controlled by
+        # --window-attn-logit-bias.
+        nn.init.zeros_(self.window_attn_conf[-1].weight)
+        nn.init.zeros_(self.window_attn_conf[-1].bias)
+
         # Important:
         # zero-init makes learn_attn start from uniform attention,
         # approximately equivalent to mean aggregation at the beginning.

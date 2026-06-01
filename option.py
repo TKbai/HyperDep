@@ -168,6 +168,7 @@ parser.add_argument(
         "attn_logit",
         "noisy_or",
         "learn_attn",
+        "learn_attn_conf",
     ],
     help="aggregation method for multi-window video probability",
 )
@@ -321,6 +322,14 @@ parser.add_argument(
     type=float,
     default=1.0,
     help="temperature for learnable window attention softmax",
+)
+
+
+parser.add_argument(
+    "--window-attn-logit-bias",
+    type=float,
+    default=0.5,
+    help="logit prior strength for confidence-aware learnable window attention",
 )
 
 parser.add_argument("--eval-threshold", type=float, default=0.5, help="default classification threshold")
