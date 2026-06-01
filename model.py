@@ -250,7 +250,58 @@ class Model(nn.Module):
 
         self.HyperCLS = HypClassifier(args)
 
-    def forward(self, inputs, seq_len):
+        # -----------------------------------------------------
+        # Learnable window-level attention MIL.
+        # Used only when window_agg == "learn_attn".
+        # Input dim is args.dim * 2, same as out_x / HyperCLS input.
+        # -----------------------------------------------------
+        self.window_emb_dim = int(args.dim) * 2
+
+        self.window_attn = nn.Sequential(
+            nn.Linear(
+                self.window_emb_dim,
+                int(getattr(args, "window_attn_hidden", 64)),
+            ),
+            nn.Tanh(),
+            nn.Dropout(float(getattr(args, "window_attn_dropout", 0.1))),
+            nn.Linear(
+                int(getattr(args, "window_attn_hidden", 64)),
+                1,
+            ),
+        )
+
+        # Important:
+        # zero-init makes learn_attn start from uniform attention,
+        # approximately equivalent to mean aggregation at the beginning.
+        nn.init.zeros_(self.window_attn[-1].weight)
+        nn.init.zeros_(self.window_attn[-1].bias)
+
+    def masked_mean_pool(self, x, seq_len):
+        """
+        x: [B, T, D]
+        seq_len: [B]
+        return: [B, D]
+        """
+
+        if seq_len is None:
+            return x.mean(dim=1)
+
+        valid_len = seq_len.long()
+        valid_len = torch.clamp(valid_len, min=1, max=x.shape[1])
+
+        mask = (
+            torch.arange(x.shape[1], device=x.device)
+            .unsqueeze(0)
+            < valid_len.unsqueeze(1)
+        )
+
+        mask = mask.unsqueeze(-1).to(x.dtype)  # [B, T, 1]
+
+        pooled = (x * mask).sum(dim=1) / valid_len.unsqueeze(-1).to(x.dtype)
+
+        return pooled
+
+    def forward(self, inputs, seq_len, return_embedding=False):
         """
         inputs: [B, T, 161]
                 first 136 dims are visual features,
@@ -405,15 +456,20 @@ class Model(nn.Module):
         feature_branch_weight = float(getattr(self.args, "feature_branch_weight", 1.0))
         temporal_branch_weight = float(getattr(self.args, "temporal_branch_weight", 1.0))
 
-        x1 = feature_branch_weight * x1
-        x2 = temporal_branch_weight * x2
-
         out_x = torch.cat((x1, x2), dim=2)
+
+        # Window-level representation for learnable window attention.
+        # Shape: [B, args.dim * 2]
+        window_emb = self.masked_mean_pool(out_x, seq_len)
+
         # Frame/snippet-level logits
         frame_prob = self.HyperCLS(out_x)
 
-        # Video-level probability after MIL pooling
+        # Video-level probability after MIL pooling inside each window
         mil_logits = self.clas(frame_prob, seq_len)
+
+        if return_embedding:
+            return mil_logits, frame_prob, window_emb
 
         return mil_logits, frame_prob
 

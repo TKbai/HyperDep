@@ -167,6 +167,7 @@ parser.add_argument(
         "logit_top2_mean",
         "attn_logit",
         "noisy_or",
+        "learn_attn",
     ],
     help="aggregation method for multi-window video probability",
 )
@@ -299,6 +300,27 @@ parser.add_argument(
     type=float,
     default=1.0,
     help="weight for temporal-distance hyperbolic graph branch",
+)
+
+parser.add_argument(
+    "--window-attn-hidden",
+    type=int,
+    default=64,
+    help="hidden size of learnable window attention module",
+)
+
+parser.add_argument(
+    "--window-attn-dropout",
+    type=float,
+    default=0.1,
+    help="dropout rate of learnable window attention module",
+)
+
+parser.add_argument(
+    "--window-attn-temperature",
+    type=float,
+    default=1.0,
+    help="temperature for learnable window attention softmax",
 )
 
 parser.add_argument("--eval-threshold", type=float, default=0.5, help="default classification threshold")

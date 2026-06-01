@@ -84,12 +84,29 @@ def collect_dvlog_outputs(dataloader, model, args, max_batches=None):
             inputs = inputs.float().to(device, non_blocking=True)
             seq_len = seq_len.to(device)
 
-            window_prob, frame_prob = model(inputs, seq_len)
+            window_agg = getattr(args, "window_agg", "mean")
+
+            if window_agg == "learn_attn":
+                window_prob, frame_prob, window_emb = model(
+                    inputs,
+                    seq_len,
+                    return_embedding=True,
+                )
+            else:
+                window_prob, frame_prob = model(inputs, seq_len)
+                window_emb = None
+
             window_prob = window_prob.view(b, k)
+
+            if window_emb is not None:
+                window_emb = window_emb.view(b, k, -1)
 
             video_prob = aggregate_window_probs_tensor(
                 window_prob,
-                mode=getattr(args, "window_agg", "mean"),
+                mode=window_agg,
+                window_emb=window_emb,
+                attn_layer=getattr(model, "window_attn", None),
+                attn_temperature=getattr(args, "window_attn_temperature", 1.0),
             )
 
         else:

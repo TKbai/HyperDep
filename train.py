@@ -47,9 +47,16 @@ def _compute_loss_with_aux(model, criterion, labels, args, base_loss, batch_size
 
         if batch_size is not None and num_windows is not None:
             aux_prob = aux_prob.view(batch_size, num_windows)
+            aux_agg_mode = getattr(args, "window_agg", "mean")
+
+            # Auxiliary branches do not have window embeddings.
+            # Use mean aggregation for aux loss when main aggregation is learn_attn.
+            if aux_agg_mode == "learn_attn":
+                aux_agg_mode = "mean"
+
             aux_prob = aggregate_window_probs_tensor(
                 aux_prob,
-                mode=getattr(args, "window_agg", "mean"),
+                mode=aux_agg_mode,
             )
 
         if aux_prob.shape != labels.shape:
@@ -147,12 +154,29 @@ def train(dataloader, model, optimizer, args, criterion, max_batches=None):
             inputs = inputs.float().to(args.device, non_blocking=True)
             seq_len = seq_len.to(args.device)
 
-            window_prob, frame_prob = model(inputs, seq_len)
+            window_agg = getattr(args, "window_agg", "mean")
+
+            if window_agg == "learn_attn":
+                window_prob, frame_prob, window_emb = model(
+                    inputs,
+                    seq_len,
+                    return_embedding=True,
+                )
+            else:
+                window_prob, frame_prob = model(inputs, seq_len)
+                window_emb = None
+
             window_prob = window_prob.view(b, k)
+
+            if window_emb is not None:
+                window_emb = window_emb.view(b, k, -1)
 
             video_prob = aggregate_window_probs_tensor(
                 window_prob,
-                mode=getattr(args, "window_agg", "mean"),
+                mode=window_agg,
+                window_emb=window_emb,
+                attn_layer=getattr(model, "window_attn", None),
+                attn_temperature=getattr(args, "window_attn_temperature", 1.0),
             )
 
             if video_prob.shape != labels.shape:
