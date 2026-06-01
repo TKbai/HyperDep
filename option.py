@@ -158,7 +158,16 @@ parser.add_argument(
 parser.add_argument(
     "--window-agg",
     default="mean",
-    choices=["mean", "max", "top2_mean", "top3_mean"],
+    choices=[
+        "mean",
+        "max",
+        "top2_mean",
+        "top3_mean",
+        "logit_mean",
+        "logit_top2_mean",
+        "attn_logit",
+        "noisy_or",
+    ],
     help="aggregation method for multi-window video probability",
 )
 
