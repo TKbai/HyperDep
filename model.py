@@ -74,7 +74,13 @@ class Model(nn.Module):
 
         self.fusion = getattr(args, "fusion", "concat_proj")
 
-        if self.fusion not in ["concat_proj", "detour_adapted", "gated_scalar", "residual_gate"]:
+        if self.fusion not in [
+            "concat_proj",
+            "detour_adapted",
+            "gated_scalar",
+            "residual_gate",
+            "dri_fusion",
+        ]:
             raise ValueError(f"Unknown fusion type: {self.fusion}")
 
         # args.feat_dim should be 256 before adding Lorentz time axis.
@@ -134,7 +140,7 @@ class Model(nn.Module):
         self.a_conv2 = None
         self.a_proj = None
 
-        if self.fusion in ["concat_proj", "gated_scalar", "residual_gate"]:
+        if self.fusion in ["concat_proj", "gated_scalar", "residual_gate", "dri_fusion"]:
             # Current baseline: symmetric two-step audio projection
             # Also used by gated_scalar fusion.
             self.a_conv1 = nn.Conv1d(
@@ -161,6 +167,45 @@ class Model(nn.Module):
                 kernel_size=1,
                 padding=0,
             )
+
+
+        # -----------------------------------------------------
+        # DRI-Fusion: Depression-aware Residual Interaction Fusion
+        #
+        # v: visual projected feature [B, T, 128]
+        # a: audio projected feature  [B, T, 128]
+        #
+        # base = concat(v, a)
+        # interaction = MLP([v, a, |v-a|, v*a])
+        # x = base + gamma * interaction
+        #
+        # Zero-init the last layer so DRI starts from the original
+        # concat baseline.
+        # -----------------------------------------------------
+        self.dri_mlp = None
+        self.dri_gamma = float(getattr(args, "dri_gamma", 0.1))
+
+        if self.fusion == "dri_fusion":
+            if self.visual_proj_dim != self.audio_proj_dim:
+                raise ValueError(
+                    "dri_fusion requires visual_proj_dim == audio_proj_dim, "
+                    f"but got {self.visual_proj_dim} and {self.audio_proj_dim}"
+                )
+
+            dri_in_dim = self.visual_proj_dim * 4
+            dri_hidden_dim = int(getattr(args, "dri_hidden_dim", self.raw_feat_dim))
+            dri_dropout = float(getattr(args, "dri_dropout", 0.1))
+
+            self.dri_mlp = nn.Sequential(
+                nn.Linear(dri_in_dim, dri_hidden_dim),
+                nn.LeakyReLU(),
+                nn.Dropout(dri_dropout),
+                nn.Linear(dri_hidden_dim, self.raw_feat_dim),
+            )
+
+            # Make DRI-Fusion start as exact concat baseline.
+            nn.init.zeros_(self.dri_mlp[-1].weight)
+            nn.init.zeros_(self.dri_mlp[-1].bias)
 
         # -----------------------------------------------------
         # Scalar modality reliability gate.
@@ -249,6 +294,38 @@ class Model(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
         self.HyperCLS = HypClassifier(args)
+
+        # -----------------------------------------------------
+        # Late Logit Residual Fusion
+        #
+        # Main HyperVD branch remains unchanged.
+        # Visual/audio branches only provide small residual logits
+        # at final video-level prediction.
+        #
+        # final_logit = main_logit + beta_v * visual_logit + beta_a * audio_logit
+        #
+        # beta_v and beta_a are zero-initialized, so the model starts
+        # exactly as the current concat baseline.
+        # -----------------------------------------------------
+        self.use_late_logit_fusion = int(getattr(args, "use_late_logit_fusion", 0)) == 1
+        self.late_logit_beta_scale = float(getattr(args, "late_logit_beta_scale", 0.2))
+
+        self.late_v_cls = None
+        self.late_a_cls = None
+        self.raw_beta_v = None
+        self.raw_beta_a = None
+        self.late_logit_dropout = None
+
+        if self.use_late_logit_fusion:
+            self.late_logit_dropout = nn.Dropout(
+                float(getattr(args, "late_logit_dropout", 0.0))
+            )
+
+            self.late_v_cls = nn.Linear(self.visual_proj_dim, 1)
+            self.late_a_cls = nn.Linear(self.audio_proj_dim, 1)
+
+            self.raw_beta_v = nn.Parameter(torch.zeros(1))
+            self.raw_beta_a = nn.Parameter(torch.zeros(1))
 
         # -----------------------------------------------------
         # Learnable window-level attention MIL.
@@ -372,7 +449,7 @@ class Model(nn.Module):
         # -----------------------------------------------------
         xa = xa.permute(0, 2, 1)
 
-        if self.fusion in ["concat_proj", "gated_scalar", "residual_gate"]:
+        if self.fusion in ["concat_proj", "gated_scalar", "residual_gate", "dri_fusion"]:
             xa = self.relu(self.a_conv1(xa))
             xa = self.dropout(xa)
             xa = self.relu(self.a_conv2(xa))
@@ -403,9 +480,48 @@ class Model(nn.Module):
                 self.aux_outputs["audio"] = self.clas(a_frame_logits, seq_len)
 
         # -----------------------------------------------------
+        # Late unimodal video-level probabilities
+        # Used only by Late Logit Residual Fusion.
+        # These do not affect the hyperbolic graph features.
+        # -----------------------------------------------------
+        late_v_prob = None
+        late_a_prob = None
+
+        if self.use_late_logit_fusion:
+            v_frame_logit = self.late_v_cls(
+                self.late_logit_dropout(xv)
+            )  # [B, T, 1]
+
+            a_frame_logit = self.late_a_cls(
+                self.late_logit_dropout(xa)
+            )  # [B, T, 1]
+
+            late_v_prob = self.clas(v_frame_logit, seq_len)  # [B]
+            late_a_prob = self.clas(a_frame_logit, seq_len)  # [B]
+
+        # -----------------------------------------------------
         # Fuse visual and acoustic features
         # -----------------------------------------------------
-        if self.fusion in ["gated_scalar", "residual_gate"]:
+        if self.fusion == "dri_fusion":
+            # Base concat feature: same as the strongest baseline.
+            base = torch.cat((xv, xa), dim=-1)  # [B, T, 256]
+
+            # Audio-visual interaction features.
+            interaction_input = torch.cat(
+                [
+                    xv,
+                    xa,
+                    torch.abs(xv - xa),
+                    xv * xa,
+                ],
+                dim=-1,
+            )  # [B, T, 512]
+
+            interaction = self.dri_mlp(interaction_input)  # [B, T, 256]
+
+            x = base + self.dri_gamma * interaction
+
+        elif self.fusion in ["gated_scalar", "residual_gate"]:
             gate_input = torch.cat(
                 [
                     xv,
@@ -418,13 +534,10 @@ class Model(nn.Module):
             gate = torch.sigmoid(self.gate_mlp(gate_input))  # [B, T, 1]
 
             if self.fusion == "gated_scalar":
-                # Raw gate, kept for ablation.
                 xv_gated = 2.0 * gate * xv
                 xa_gated = 2.0 * (1.0 - gate) * xa
 
             elif self.fusion == "residual_gate":
-                # Conservative residual gate.
-                # delta is restricted to [-gamma, gamma].
                 gamma = max(0.0, min(float(self.gate_gamma), 1.0))
                 delta = gamma * (2.0 * gate - 1.0)
 
@@ -485,11 +598,24 @@ class Model(nn.Module):
         # Shape: [B, args.dim * 2]
         window_emb = self.masked_mean_pool(out_x, seq_len)
 
-        # Frame/snippet-level logits
         frame_prob = self.HyperCLS(out_x)
 
-        # Video-level probability after MIL pooling inside each window
+        # Main HyperVD video-level probability
         mil_logits = self.clas(frame_prob, seq_len)
+
+        # -----------------------------------------------------
+        # Late Logit Residual Fusion
+        # -----------------------------------------------------
+        if self.use_late_logit_fusion and late_v_prob is not None and late_a_prob is not None:
+            main_logit = self.prob_to_logit(mil_logits)
+            v_logit = self.prob_to_logit(late_v_prob)
+            a_logit = self.prob_to_logit(late_a_prob)
+
+            beta_v = self.late_logit_beta_scale * torch.tanh(self.raw_beta_v)
+            beta_a = self.late_logit_beta_scale * torch.tanh(self.raw_beta_a)
+
+            final_logit = main_logit + beta_v * v_logit + beta_a * a_logit
+            mil_logits = torch.sigmoid(final_logit)
 
         if return_embedding:
             return mil_logits, frame_prob, window_emb
@@ -641,6 +767,14 @@ class Model(nn.Module):
                 output[i, :valid_len, :valid_len] = adj2
 
         return output
+
+    def prob_to_logit(self, prob, eps=1e-6):
+        """
+        Convert probability to logit safely.
+        prob: [B]
+        """
+        prob = torch.clamp(prob, min=eps, max=1.0 - eps)
+        return torch.log(prob / (1.0 - prob))
 
     def clas(self, logits, seq_len):
         """

@@ -195,8 +195,14 @@ parser.add_argument(
 parser.add_argument(
     "--fusion",
     default="concat_proj",
-    choices=["concat_proj", "detour_adapted", "gated_scalar", "residual_gate"],
-    help="fusion type: concat_proj, detour_adapted, gated_scalar, or residual_gate",
+    choices=[
+        "concat_proj",
+        "detour_adapted",
+        "gated_scalar",
+        "residual_gate",
+        "dri_fusion",
+    ],
+    help="fusion type",
 )
 
 parser.add_argument(
@@ -331,6 +337,50 @@ parser.add_argument(
     default=0.5,
     help="logit prior strength for confidence-aware learnable window attention",
 )
+
+parser.add_argument(
+    "--dri-gamma",
+    type=float,
+    default=0.1,
+    help="residual scale for DRI-Fusion interaction branch",
+)
+
+parser.add_argument(
+    "--dri-hidden-dim",
+    type=int,
+    default=256,
+    help="hidden dimension of DRI-Fusion interaction MLP",
+)
+
+parser.add_argument(
+    "--dri-dropout",
+    type=float,
+    default=0.1,
+    help="dropout rate inside DRI-Fusion interaction branch",
+)
+
+parser.add_argument(
+    "--use-late-logit-fusion",
+    type=int,
+    default=0,
+    choices=[0, 1],
+    help="whether to use late logit residual fusion",
+)
+
+parser.add_argument(
+    "--late-logit-beta-scale",
+    type=float,
+    default=0.2,
+    help="maximum scale for late visual/audio logit residuals",
+)
+
+parser.add_argument(
+    "--late-logit-dropout",
+    type=float,
+    default=0.0,
+    help="dropout rate for late unimodal logit heads",
+)
+
 
 parser.add_argument("--eval-threshold", type=float, default=0.5, help="default classification threshold")
 parser.add_argument("--weight-decay", type=float, default=1e-5, help="weight decay")
