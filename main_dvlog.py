@@ -98,6 +98,7 @@ def main():
     print("train_windows:", args.train_num_windows)
     print("eval_windows :", args.eval_num_windows)
     print("window_agg   :", args.window_agg)
+    print("adj_threshold:", args.adj_threshold)
     print("save_dir    :", args.save_dir)
     print("model_name  :", args.model_name)
     print("============================================")

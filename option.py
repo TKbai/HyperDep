@@ -195,6 +195,12 @@ parser.add_argument(
     help="maximum residual gate strength for residual_gate fusion",
 )
 
+parser.add_argument(
+    "--adj-threshold",
+    type=float,
+    default=0.8,
+    help="threshold for feature-similarity graph construction; original HyperVD uses 0.8",
+)
 
 parser.add_argument(
     "--pool-alpha",
@@ -222,6 +228,68 @@ parser.add_argument(
     default="both",
     choices=["none", "visual", "audio", "both"],
     help="which auxiliary unimodal losses to use",
+)
+
+parser.add_argument(
+    "--adj-mode",
+    default="soft_threshold",
+    choices=["soft_threshold", "hard_threshold", "topk"],
+    help="feature graph construction mode",
+)
+
+parser.add_argument(
+    "--adj-topk",
+    type=int,
+    default=20,
+    help="number of nearest neighbors for topk adjacency",
+)
+
+parser.add_argument(
+    "--use-temporal-conv",
+    type=int,
+    default=0,
+    choices=[0, 1],
+    help="whether to use lightweight temporal residual convolution before expmap",
+)
+
+parser.add_argument(
+    "--temporal-kernel",
+    type=int,
+    default=5,
+    help="kernel size of temporal residual convolution",
+)
+
+parser.add_argument(
+    "--temporal-conv-scale",
+    type=float,
+    default=0.3,
+    help="residual scale for temporal convolution branch",
+)
+
+parser.add_argument(
+    "--temporal-dropout",
+    type=float,
+    default=0.1,
+    help="dropout rate inside temporal residual conv",
+)
+parser.add_argument(
+    "--graph-branch",
+    default="both",
+    choices=["both", "feature_only", "temporal_only"],
+    help="which hyperbolic graph branch to use",
+)
+parser.add_argument(
+    "--feature-branch-weight",
+    type=float,
+    default=1.0,
+    help="weight for feature-similarity hyperbolic graph branch",
+)
+
+parser.add_argument(
+    "--temporal-branch-weight",
+    type=float,
+    default=1.0,
+    help="weight for temporal-distance hyperbolic graph branch",
 )
 
 parser.add_argument("--eval-threshold", type=float, default=0.5, help="default classification threshold")

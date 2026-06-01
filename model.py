@@ -55,6 +55,9 @@ class Model(nn.Module):
 
         self.args = args
         self.manifold = getattr(manifolds, args.manifold)()
+        self.adj_threshold = float(getattr(args, "adj_threshold", 0.8))
+        self.adj_mode = getattr(args, "adj_mode", "soft_threshold")
+        self.adj_topk = int(getattr(args, "adj_topk", 20))
 
         # =====================================================
         # D-Vlog input setting:
@@ -192,6 +195,52 @@ class Model(nn.Module):
         self.a_aux_cls = nn.Linear(self.audio_proj_dim, 1)
         self.aux_outputs = {}
 
+        # -----------------------------------------------------
+        # Lightweight temporal residual convolution.
+        # Applied before expmap, while x is still Euclidean.
+        # -----------------------------------------------------
+        self.use_temporal_conv = int(getattr(args, "use_temporal_conv", 0)) == 1
+        self.temporal_conv_scale = float(getattr(args, "temporal_conv_scale", 0.3))
+
+        self.temp_dwconv = None
+        self.temp_pwconv = None
+        self.temp_act = None
+
+        if self.use_temporal_conv:
+            temporal_kernel = int(getattr(args, "temporal_kernel", 5))
+
+            if temporal_kernel % 2 == 0:
+                raise ValueError(
+                    f"temporal_kernel should be odd, got {temporal_kernel}"
+                )
+
+            self.temp_dwconv = nn.Conv1d(
+                in_channels=self.raw_feat_dim,
+                out_channels=self.raw_feat_dim,
+                kernel_size=temporal_kernel,
+                padding=temporal_kernel // 2,
+                groups=self.raw_feat_dim,
+                bias=True,
+            )
+
+            self.temp_pwconv = nn.Conv1d(
+                in_channels=self.raw_feat_dim,
+                out_channels=self.raw_feat_dim,
+                kernel_size=1,
+                padding=0,
+                bias=True,
+            )
+
+            self.temp_act = nn.LeakyReLU()
+
+            self.temp_dropout = nn.Dropout(
+                float(getattr(args, "temporal_dropout", 0.1))
+            )
+
+            # Zero-init last conv so temporal branch starts as no-op.
+            nn.init.zeros_(self.temp_pwconv.weight)
+            nn.init.zeros_(self.temp_pwconv.bias)
+
         self.HFSGCN = FHyperGCN(args)
         self.HTRGCN = FHyperGCN(args)
 
@@ -320,6 +369,9 @@ class Model(nn.Module):
                 f"but got {x.size(-1)}."
             )
 
+        if self.use_temporal_conv:
+            x = self.temporal_residual_conv(x, seq_len)
+
         # Temporal-distance graph
         disadj = self.disAdj(x.shape[0], x.shape[1], self.args).to(x.device)
 
@@ -336,8 +388,27 @@ class Model(nn.Module):
         x2 = self.relu(self.HTRGCN.encode(proj_x, disadj))
         x2 = self.dropout(x2)
 
-        out_x = torch.cat((x1, x2), dim=2)
+        graph_branch = getattr(self.args, "graph_branch", "both")
 
+        if graph_branch == "feature_only":
+            x2 = torch.zeros_like(x2)
+
+        elif graph_branch == "temporal_only":
+            x1 = torch.zeros_like(x1)
+
+        elif graph_branch == "both":
+            pass
+
+        else:
+            raise ValueError(f"Unknown graph_branch: {graph_branch}")
+
+        feature_branch_weight = float(getattr(self.args, "feature_branch_weight", 1.0))
+        temporal_branch_weight = float(getattr(self.args, "temporal_branch_weight", 1.0))
+
+        x1 = feature_branch_weight * x1
+        x2 = temporal_branch_weight * x2
+
+        out_x = torch.cat((x1, x2), dim=2)
         # Frame/snippet-level logits
         frame_prob = self.HyperCLS(out_x)
 
@@ -345,6 +416,40 @@ class Model(nn.Module):
         mil_logits = self.clas(frame_prob, seq_len)
 
         return mil_logits, frame_prob
+
+    def temporal_residual_conv(self, x, seq_len):
+        """
+        Local temporal context before hyperbolic expmap.
+
+        x: [B, T, D]
+        seq_len: [B]
+        """
+
+        residual = x
+
+        xt = x.transpose(1, 2)  # [B, D, T]
+        xt = self.temp_dwconv(xt)
+        xt = self.temp_act(xt)
+        xt = self.temp_pwconv(xt)
+        xt = self.temp_dropout(xt)
+        xt = xt.transpose(1, 2)  # [B, T, D]
+
+        x = residual + self.temporal_conv_scale * xt
+
+        # Keep padded positions zero.
+        if seq_len is not None:
+            valid_len = seq_len.long()
+            valid_len = torch.clamp(valid_len, min=1, max=x.shape[1])
+
+            mask = (
+                torch.arange(x.shape[1], device=x.device)
+                .unsqueeze(0)
+                < valid_len.unsqueeze(1)
+            )
+
+            x = x * mask.unsqueeze(-1).to(x.dtype)
+
+        return x
 
     def expm(self, x):
         """
@@ -362,6 +467,67 @@ class Model(nn.Module):
             return x
 
         return x
+    
+    def normalize_feature_adj(self, adj_sim):
+        """
+        Build normalized feature-similarity adjacency.
+
+        adj_sim: [L, L], similarity matrix, larger means more similar.
+
+        Modes:
+            soft_threshold:
+                Original HyperVD-style behavior.
+                Values below threshold are set to 0, then softmax.
+
+            hard_threshold:
+                Values below threshold are masked out before softmax.
+
+            topk:
+                For each snippet, keep top-k most similar snippets.
+        """
+
+        if adj_sim.dim() != 2:
+            raise ValueError(f"Expected adj_sim shape [L, L], got {adj_sim.shape}")
+
+        l = adj_sim.shape[0]
+
+        if l <= 0:
+            return adj_sim
+
+        if self.adj_mode == "soft_threshold":
+            adj = F.threshold(adj_sim, self.adj_threshold, 0.0)
+            adj = F.softmax(adj, dim=1)
+            return adj
+
+        elif self.adj_mode == "hard_threshold":
+            mask = adj_sim > self.adj_threshold
+
+            # Always keep self-loop to avoid empty rows.
+            eye = torch.eye(l, device=adj_sim.device, dtype=torch.bool)
+            mask = mask | eye
+
+            masked_adj = adj_sim.masked_fill(~mask, -1e9)
+            adj = F.softmax(masked_adj, dim=1)
+            return adj
+
+        elif self.adj_mode == "topk":
+            k = max(1, min(self.adj_topk, l))
+
+            values, indices = torch.topk(
+                adj_sim,
+                k=k,
+                dim=1,
+                largest=True,
+            )
+
+            masked_adj = torch.full_like(adj_sim, -1e9)
+            masked_adj.scatter_(dim=1, index=indices, src=values)
+
+            adj = F.softmax(masked_adj, dim=1)
+            return adj
+
+        else:
+            raise ValueError(f"Unknown adj_mode: {self.adj_mode}")
 
     def adj(self, x, seq_len):
         """
@@ -378,8 +544,7 @@ class Model(nn.Module):
         if seq_len is None:
             for i in range(x.shape[0]):
                 adj2 = x2[i]
-                adj2 = F.threshold(adj2, 0.8, 0)
-                adj2 = soft(adj2)
+                adj2 = self.normalize_feature_adj(adj2)
                 output[i] = adj2
         else:
             for i in range(x.shape[0]):
@@ -392,8 +557,7 @@ class Model(nn.Module):
                 valid_len = max(1, min(valid_len, x.shape[1]))
 
                 adj2 = x2[i, :valid_len, :valid_len]
-                adj2 = F.threshold(adj2, 0.8, 0)
-                adj2 = soft(adj2)
+                adj2 = self.normalize_feature_adj(adj2)
 
                 output[i, :valid_len, :valid_len] = adj2
 
