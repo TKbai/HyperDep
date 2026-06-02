@@ -37,3 +37,7 @@ logs/
 # System
 .DS_Store
 Thumbs.db
+LMVD/
+lmvd-dataset/
+ckpt_lmvd/
+logs_lmvd/
