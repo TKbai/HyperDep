@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
+
+CUDA_ID="${CUDA_ID:-0}"
 
 mkdir -p logs_lmvd ckpt_lmvd
 
 for seed in 9 42 2024
 do
+  echo "============================================================"
+  echo "Running LMVD Detour-a05 seed=${seed}"
+  echo "============================================================"
+
   python main_lmvd.py \
     --manifest-path LMVD/processed_811/manifest.csv \
     --stats-path LMVD/processed_811/lmvd_stats.npz \
@@ -37,5 +43,6 @@ do
     --test-fold test \
     --lmvd-norm-clip 10.0 \
     --seed ${seed} \
-    --cuda 0 | tee logs_lmvd/hypervd_lmvd_seq300_detour_a05_selauprc_thrf1pos_seed${seed}.log
+    --cuda "${CUDA_ID}" \
+    2>&1 | tee logs_lmvd/hypervd_lmvd_seq300_detour_a05_selauprc_thrf1pos_seed${seed}.log
 done
