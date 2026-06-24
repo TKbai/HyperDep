@@ -1,4 +1,5 @@
 from models.base_models import *
+from models.edge_gatv2 import ResidualEdgeGATv2Adj
 from layers.hyp_layers import *
 from geoopt import ManifoldParameter
 import torch
@@ -289,6 +290,36 @@ class Model(nn.Module):
         self.HFSGCN = FHyperGCN(args)
         self.HTRGCN = FHyperGCN(args)
 
+        # -----------------------------------------------------
+        # Optional GATv2-style residual refinement of the
+        # feature-similarity adjacency before HFSGCN.
+        # The temporal graph branch remains unchanged.
+        # -----------------------------------------------------
+        self.feature_adj_refiner = getattr(
+            args, "feature_adj_refiner", "none"
+        )
+
+        if self.feature_adj_refiner not in ["none", "gatv2"]:
+            raise ValueError(
+                f"Unknown feature_adj_refiner: {self.feature_adj_refiner}"
+            )
+
+        self.edge_gatv2 = None
+
+        if self.feature_adj_refiner == "gatv2":
+            self.edge_gatv2 = ResidualEdgeGATv2Adj(
+                input_dim=self.raw_feat_dim,
+                hidden_dim=int(getattr(args, "edge_gatv2_hidden", 32)),
+                dropout=float(getattr(args, "edge_gatv2_dropout", 0.1)),
+                negative_slope=0.2,
+                delta_scale=float(
+                    getattr(args, "edge_gatv2_delta_scale", 1.0)
+                ),
+                use_temporal_edge=(
+                    int(getattr(args, "edge_gatv2_use_temporal", 1)) == 1
+                ),
+            )
+
         self.dropout = nn.Dropout(args.dropout)
         self.relu = nn.LeakyReLU()
         self.sigmoid = nn.Sigmoid()
@@ -401,7 +432,13 @@ class Model(nn.Module):
 
         return pooled
 
-    def forward(self, inputs, seq_len, return_embedding=False):
+    def forward(
+        self,
+        inputs,
+        seq_len,
+        return_embedding=False,
+        return_graph_info=False,
+    ):
         """
         inputs: [B, T, 161]
                 first 136 dims are visual features,
@@ -566,7 +603,51 @@ class Model(nn.Module):
         proj_x = self.expm(x)
 
         # Feature-similarity graph
-        adj = self.adj(proj_x, seq_len)
+        base_adj = self.adj(proj_x, seq_len)
+        adj = base_adj
+        graph_info = None
+
+        # Optional GATv2-style residual edge reweighting.
+        # Node representations and hyperbolic message passing stay unchanged;
+        # only the feature adjacency is dynamically refined.
+        if self.edge_gatv2 is not None:
+            if return_graph_info:
+                adj, edge_details = self.edge_gatv2(
+                    x=x,
+                    base_adj=base_adj,
+                    seq_len=seq_len,
+                    return_details=True,
+                )
+
+                graph_info = {
+                    "base_adj": base_adj,
+                    "refined_adj": adj,
+                    **edge_details,
+                }
+            else:
+                adj = self.edge_gatv2(
+                    x=x,
+                    base_adj=base_adj,
+                    seq_len=seq_len,
+                )
+        elif return_graph_info:
+            pair_mask = torch.zeros_like(base_adj, dtype=torch.bool)
+            for batch_idx in range(base_adj.shape[0]):
+                if seq_len is None:
+                    valid_len = base_adj.shape[1]
+                else:
+                    valid_len = int(seq_len[batch_idx].detach().cpu().item())
+                    valid_len = max(1, min(valid_len, base_adj.shape[1]))
+
+                pair_mask[batch_idx, :valid_len, :valid_len] = True
+
+            graph_info = {
+                "base_adj": base_adj,
+                "refined_adj": base_adj,
+                "delta": torch.zeros_like(base_adj),
+                "scaled_delta": torch.zeros_like(base_adj),
+                "pair_mask": pair_mask,
+            }
 
         # Two hyperbolic GCN branches
         x1 = self.relu(self.HFSGCN.encode(proj_x, adj))
@@ -617,8 +698,14 @@ class Model(nn.Module):
             final_logit = main_logit + beta_v * v_logit + beta_a * a_logit
             mil_logits = torch.sigmoid(final_logit)
 
+        if return_embedding and return_graph_info:
+            return mil_logits, frame_prob, window_emb, graph_info
+
         if return_embedding:
             return mil_logits, frame_prob, window_emb
+
+        if return_graph_info:
+            return mil_logits, frame_prob, graph_info
 
         return mil_logits, frame_prob
 

@@ -382,5 +382,54 @@ parser.add_argument(
 )
 
 
+# =========================================================
+# 7. GATv2-style feature adjacency refinement
+# =========================================================
+parser.add_argument(
+    "--feature-adj-refiner",
+    default="none",
+    choices=["none", "gatv2"],
+    help=(
+        "optional dynamic refinement of the feature-similarity adjacency; "
+        "gatv2 uses a residual GATv2-style edge scorer before HFSGCN"
+    ),
+)
+
+parser.add_argument(
+    "--edge-gatv2-hidden",
+    type=int,
+    default=32,
+    help="hidden dimension of the GATv2 edge scorer",
+)
+
+parser.add_argument(
+    "--edge-gatv2-dropout",
+    type=float,
+    default=0.1,
+    help="dropout rate of the GATv2 residual edge logits",
+)
+
+parser.add_argument(
+    "--edge-gatv2-delta-scale",
+    type=float,
+    default=1.0,
+    help="scale of learned residual edge-logit corrections",
+)
+
+parser.add_argument(
+    "--edge-gatv2-use-temporal",
+    type=int,
+    default=1,
+    choices=[0, 1],
+    help="whether the edge scorer uses normalized temporal distance",
+)
+
+parser.add_argument(
+    "--edge-gatv2-heads",
+    type=int,
+    default=1,
+    help="number of Edge-GATv2 edge-scoring heads",
+)
+
 parser.add_argument("--eval-threshold", type=float, default=0.5, help="default classification threshold")
 parser.add_argument("--weight-decay", type=float, default=1e-5, help="weight decay")
