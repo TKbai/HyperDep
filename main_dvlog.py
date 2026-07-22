@@ -15,6 +15,56 @@ from train import train
 from eval_dvlog import evaluate_dvlog, find_best_threshold, print_metrics
 from dataset_dvlog_mw import DVlogMultiWindowDataset
 
+def add_argument_if_absent(parser, *flags, **kwargs):
+    for flag in flags:
+        if flag in parser._option_string_actions:
+            return
+    parser.add_argument(*flags, **kwargs)
+
+
+add_argument_if_absent(
+    option.parser,
+    "--selection-metric",
+    default=None,
+    choices=[
+        "f1",
+        "f1_weighted",
+        "f1_pos",
+        "f1_macro",
+        "balanced_acc",
+        "acc",
+        "auc",
+        "auprc",
+    ],
+    help="validation metric used to select the best checkpoint",
+)
+
+add_argument_if_absent(
+    option.parser,
+    "--threshold-metric",
+    default=None,
+    choices=[
+        "f1",
+        "f1_weighted",
+        "f1_pos",
+        "f1_macro",
+        "balanced_acc",
+        "acc",
+    ],
+    help="validation metric used to search the decision threshold",
+)
+
+
+def metric_value(metrics, name):
+    if name in metrics:
+        return float(metrics[name])
+
+    if name == "f1" and "f1_weighted" in metrics:
+        return float(metrics["f1_weighted"])
+
+    raise KeyError(
+        f"Metric '{name}' not found. Available metrics: {list(metrics.keys())}"
+    )
 
 def setup_seed(seed):
     random.seed(seed)
@@ -77,6 +127,12 @@ def build_loader(args, fold, shuffle, random_crop):
 def main():
     args = option.parser.parse_args()
 
+    if args.selection_metric is None:
+        args.selection_metric = args.metric
+
+    if args.threshold_metric is None:
+        args.threshold_metric = args.metric
+
     setup_seed(args.seed)
 
     args.device = get_device(args)
@@ -93,7 +149,9 @@ def main():
     print("max_seqlen  :", args.max_seqlen)
     print("batch_size  :", args.batch_size)
     print("lr          :", args.lr)
-    print("metric      :", args.metric)
+    print("metric legacy    :", args.metric)
+    print("selection_metric :", args.selection_metric)
+    print("threshold_metric :", args.threshold_metric)
     print("fusion      :", args.fusion)
     print("train_windows:", args.train_num_windows)
     print("eval_windows :", args.eval_num_windows)
@@ -161,15 +219,15 @@ def main():
             criterion=criterion,
         )
 
-        # 用 validation set 搜索最佳阈值
-        threshold_metric = "f1"
+        # 1. 在 validation 上根据 threshold_metric 搜索决策阈值
         val_threshold, val_threshold_score, _ = find_best_threshold(
             dataloader=val_loader,
             model=model,
             args=args,
-            metric=threshold_metric,
+            metric=args.threshold_metric,
         )
 
+        # 2. 使用该阈值计算完整 validation 指标
         val_metrics = evaluate_dvlog(
             dataloader=val_loader,
             model=model,
@@ -177,19 +235,30 @@ def main():
             threshold=val_threshold,
         )
 
-        current_score = val_metrics[args.metric]
+        # 3. 根据 selection_metric 选择 checkpoint
+        current_score = metric_value(
+            val_metrics,
+            args.selection_metric,
+        )
 
-        print(f"train_loss     : {train_loss:.6f}")
-        print(f"val_threshold  : {val_threshold:.6f}")
-        print(f"val_{args.metric:10s}: {current_score:.6f}")
+        print(f"train_loss            : {train_loss:.6f}")
+        print(f"val_threshold         : {val_threshold:.8f}")
         print(
-            "val summary    : "
+            f"val_threshold_{args.threshold_metric}: "
+            f"{val_threshold_score:.6f}"
+        )
+        print(
+            f"val_selection_{args.selection_metric}: "
+            f"{current_score:.6f}"
+        )
+        print(
+            "val summary           : "
             f"acc={val_metrics['acc']:.4f}, "
-            f"f1={val_metrics['f1_weighted']:.4f}, "
+            f"f1_w={val_metrics['f1_weighted']:.4f}, "
+            f"f1_pos={val_metrics['f1_pos']:.4f}, "
             f"auc={val_metrics['auc']:.4f}, "
             f"auprc={val_metrics['auprc']:.4f}"
         )
-
         if current_score > best_score:
             best_score = current_score
             best_epoch = epoch
@@ -202,6 +271,9 @@ def main():
                     "model_state_dict": best_state,
                     "best_score": best_score,
                     "best_threshold": best_threshold,
+                    "selection_metric": args.selection_metric,
+                    "threshold_metric": args.threshold_metric,
+                    "threshold_score": val_threshold_score,
                     "args": vars(args),
                 },
                 save_path,

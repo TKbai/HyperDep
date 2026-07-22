@@ -289,6 +289,18 @@ parser.add_argument(
     default=0.1,
     help="dropout rate inside temporal residual conv",
 )
+
+parser.add_argument(
+    "--temporal-gamma",
+    type=float,
+    default=2.718281828459045,
+    help=(
+        "gamma for HTRG temporal graph A_ij = exp(-|i-j|/gamma). "
+        "Default keeps old behavior close to exp(1). "
+        "Use --temporal-gamma 1.0 for HyperVD-paper-style setting."
+    ),
+)
+
 parser.add_argument(
     "--graph-branch",
     default="both",
